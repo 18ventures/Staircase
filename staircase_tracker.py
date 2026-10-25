@@ -1,0 +1,1329 @@
+"""
+STAIRCASE TRACKER — standalone service (no trading code, no Orion dependency).
+
+What it does, for BTC perps on Binance:
+  * Reads 4H / 30m / 5m candles + mark price, works out the composite colour on each (same maths as the
+    TradingView composite: lookback 100, z-score 100, extremes 90/10, Yellow=Orange, Blue=Green).
+  * Logs every staircase setup (Short/Long A-E) the moment it fires.
+  * Logs every full alignment: same colour on 4H, 30m and 5m (Red, Orange, Green, Cyan) and how long it lasted.
+  * For every log: WPR, price vs EMA200, and the outcome against TP / SL (both directions for alignments).
+  * Serves a password-protected live page for the Home Screen: /staircase
+
+Needs: STAIRCASE_TOKEN (the page password). Use DATABASE_URL (Postgres) so history survives redeploys.
+Optional: TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + TRACKER_TELEGRAM_ALERTS=true for plain (no-button) alerts.
+Run:  gunicorn staircase_tracker:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT   (ONE worker only)
+"""
+import os, time, json, base64, hmac, threading
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+from flask import Flask, jsonify, request as flask_request, redirect
+
+# ── Settings ────────────────────────────────────────────────────────────────
+SYMBOL        = os.environ.get("SYMBOL", "BTCUSDT")
+FUTURES_BASE  = os.environ.get("FUTURES_BASE", "https://fapi.binance.com")
+LOOKBACK      = int(os.environ.get("STAIRCASE_LOOKBACK", "100"))
+ZLEN          = int(os.environ.get("STAIRCASE_ZLEN", os.environ.get("STAIRCASE_ZSCORE_LEN", "100")))
+HIGH          = float(os.environ.get("STAIRCASE_EXTREME_HIGH", "90"))
+LOW           = float(os.environ.get("STAIRCASE_EXTREME_LOW", "10"))
+TF_H          = os.environ.get("STAIRCASE_TF_HIGH", "4h")
+TF_M          = os.environ.get("STAIRCASE_TF_MID", "30m")
+TF_L          = os.environ.get("STAIRCASE_TF_LOW", "5m")
+TP_PCT        = float(os.environ.get("STAIRCASE_TP_PCT", "0.45"))                  # TP1
+TP2_PCT       = float(os.environ.get("STAIRCASE_TP2_PCT", "0.55"))                  # TP2
+BE_AFTER_TP1  = os.environ.get("STAIRCASE_BE_AFTER_TP1", "false").lower() == "true"  # stop moves to entry once TP1 is hit
+SL_PCT        = float(os.environ.get("STAIRCASE_SL_PCT", "0.33"))
+CTX_TF        = os.environ.get("STAIRCASE_CTX_TF", "30m")
+WPR_LEN       = int(os.environ.get("STAIRCASE_WPR_LEN", "200"))
+LIVE_HIGH     = os.environ.get("STAIRCASE_LIVE_HIGH", "true").lower() == "true"   # false = slow TF uses closed candles only
+LIVE_MID      = os.environ.get("STAIRCASE_LIVE_MID", "false").lower() == "true"    # default false: mid TF (30m) uses closed candles only
+TIMEOUT_SECS  = 24 * 3600
+TOKEN         = os.environ.get("STAIRCASE_TOKEN", "") or os.environ.get("READ_API_SECRET", "")
+DATABASE_URL  = os.environ.get("DATABASE_URL", "")
+DATA_DIR      = os.environ.get("DATA_DIR", "./data")
+TG_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT       = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_ALERTS     = os.environ.get("TRACKER_TELEGRAM_ALERTS", "false").lower() == "true"
+MAX_HISTORY   = 3000
+# Days nothing is logged or shown (Mon=0 ... Sat=5 ... Sun=6), judged on UK time. Default: Saturday only.
+SKIP_DAYS = {int(x) for x in os.environ.get("STAIRCASE_SKIP_DAYS", "5").replace(" ", "").split(",") if x != ""}
+SKIP_TZ   = os.environ.get("STAIRCASE_SKIP_TZ", "Europe/London")
+
+
+LEVERAGE = float(os.environ.get("STAIRCASE_LEVERAGE", "50"))   # only used to show account % next to price %
+ZONE_FILTER = os.environ.get("STAIRCASE_ZONE_FILTER", "true").lower() == "true"
+ZONE_RANGE  = "mid5" if os.environ.get("STAIRCASE_ZONE_RANGE", "30m") == "5m" else "mid30"   # which midline decides
+
+
+def offzone(e):
+    """A long taken with price ABOVE the midline, or a short with price BELOW it, is not a true discount/premium
+    entry. It is still logged, but kept in its own 'off-zone' results so it never mixes with the real ones."""
+    if not ZONE_FILTER:
+        return False
+    side = next(iter(e.get("res") or {}), None)
+    ms = e.get(ZONE_RANGE + "_side")
+    return (side == "long" and ms == "above") or (side == "short" and ms == "below")
+
+
+def skipday(ts=None):
+    try:
+        return datetime.fromtimestamp(ts if ts is not None else time.time(), ZoneInfo(SKIP_TZ)).weekday() in SKIP_DAYS
+    except Exception:
+        return False
+
+TF_SECS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
+           "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800, "12h": 43200}
+
+
+def _lbl(tf):
+    return tf[:-1] + ("H" if tf.endswith("h") else "m")
+
+
+LABELS = (_lbl(TF_H), _lbl(TF_M), _lbl(TF_L))
+EMOJI = {"Red": "🟥", "Orange": "🟧", "Grey": "⬜", "Green": "🟩", "Cyan": "🟦"}
+
+# (direction, letter, slow colour, mid colour, fast colour BEFORE, fast colour NOW)
+RULES = [
+    ("short", "A++", "Red",    "Orange", "Red",    "Orange"),
+    ("short", "B", "Red",    "Orange", "Orange", "Grey"),
+    ("short", "A+", "Orange", "Red",    "Red",    "Orange"),
+    ("short", "B+", "Orange", "Red",   "Orange", "Grey"),
+    ("short", "C", "Orange", "Orange", "Orange", "Grey"),
+    ("short", "D", "Grey",   "Grey",   "Grey",   "Green"),
+    ("short", "E", "Orange", "Grey",   "Orange", "Grey"),
+    ("long",  "A++", "Cyan",   "Green",  "Cyan",   "Green"),
+    ("long",  "B", "Cyan",   "Green",  "Green",  "Grey"),
+    ("long",  "A+", "Green",  "Cyan",   "Cyan",   "Green"),
+    ("long",  "B+", "Green",  "Cyan",   "Green",  "Grey"),
+    ("long",  "C", "Green",  "Green",  "Green",  "Grey"),
+    ("long",  "D", "Grey",   "Grey",   "Grey",   "Orange"),
+    ("long",  "E", "Green",  "Grey",   "Green",  "Grey"),
+]
+NOTES = {
+    ("short", "A++"): "Early entry, best R",   ("long", "A++"): "Early entry, best R",
+    ("short", "B"): "Final confirmation",    ("long", "B"): "Final confirmation",
+    ("long", "A+"): "Test, possibly the best signal: reversal off a Cyan 30m",
+    ("short", "A+"): "Test, possibly the best signal: reversal off a Red 30m",
+    ("long", "B+"): "Test, possibly the best signal: Cyan 30m, 5m fades to Grey",
+    ("short", "B+"): "Test, possibly the best signal: Red 30m, 5m fades to Grey",
+    ("short", "C"): "Orange staircase",      ("long", "C"): "Green staircase",
+    ("short", "D"): "Bearish pullback (raw)", ("long", "D"): "Bullish pullback (raw)",
+    ("short", "E"): f"{LABELS[1]} Grey rollover", ("long", "E"): f"{LABELS[1]} Grey bounce",
+}
+# UNTESTED setups: ones you think are the best but have no results yet. Logged and scored like the others,
+# but kept out of the main Setups tab, the Results totals and the + comparison. Add more rows here.
+# (direction, id, slow colour, mid colour, fast colour BEFORE, fast colour NOW)
+UNTESTED = [
+    ("long", "U1", "Cyan", "Cyan", "Cyan", "Green"),
+    ("long", "U2", "Cyan", "Cyan", "Grey", "Orange"),
+]
+UNOTES = {
+    ("long", "U1"): f"{LABELS[0]} Cyan, {LABELS[1]} Cyan, {LABELS[2]} Cyan → Green",
+    ("long", "U2"): f"{LABELS[0]} Cyan, {LABELS[1]} Cyan, {LABELS[2]} Grey → Orange",
+}
+# Setups whose 30m colour is Grey are discarded: not logged, not shown, not counted (existing logs are hidden too).
+DROP_MID_GREY = os.environ.get("STAIRCASE_DROP_MID_GREY", "true").lower() == "true"
+if DROP_MID_GREY:
+    RULES = [r for r in RULES if r[3] != "Grey"]
+    UNTESTED = [r for r in UNTESTED if r[3] != "Grey"]
+
+
+# A++ "pocket": the 30m WPR band you expect a true A++ to sit in. Never blocks a trade, only tagged and scored separately.
+# Long: -85 to -75. Short: the mirror, -25 to -15.
+POCKET = {"long": (-85.0, -75.0), "short": (-25.0, -15.0)}
+POCKET_KEYS = ("long_A++", "short_A++")
+
+
+def in_pocket(e):
+    w = e.get("wpr")
+    if w is None or e.get("key") not in POCKET_KEYS:
+        return None
+    lo, hi = POCKET[e["key"].split("_")[0]]
+    return lo <= float(w) <= hi
+
+
+def hidden(e):
+    """Entries that are never shown or counted: logged on a skipped day, or a setup that fired with a Grey 30m."""
+    if skipday(e["t"]):
+        return True
+    return DROP_MID_GREY and e.get("kind") in ("setup", "untested") and len(e.get("cols", [])) > 1 and e["cols"][1] == "Grey"
+
+
+ALIGN_COLOURS = ["Red", "Orange", "Green", "Cyan"]   # all three timeframes the same colour (Grey excluded)
+ALIGN_DIR = {"Red": "short", "Orange": "short", "Green": "long", "Cyan": "long"}   # the trade each alignment represents
+
+
+def cfg_sig():
+    base = f"{LOOKBACK}/{ZLEN}/{HIGH:g}/{LOW:g}"
+    base = base if (TF_H, TF_M, TF_L) == ("4h", "30m", "5m") else f"{'/'.join(LABELS)}|{base}"
+    mode = ("" if LIVE_HIGH else "H") + ("" if LIVE_MID else "M")
+    return base + (f"|closed-{mode}" if mode else "")   # closed-candle modes keep their own counts
+
+
+# ── Storage: Postgres if DATABASE_URL is set, otherwise a JSON file ─────────────
+_db_ready = False
+
+
+def _db():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _init_db():
+    global _db_ready
+    if _db_ready or not DATABASE_URL:
+        return
+    conn = _db(); cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS tracker_state (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT NOW())")
+    conn.commit(); cur.close(); conn.close()
+    _db_ready = True
+
+
+STORAGE = {"mode": "postgres" if DATABASE_URL else "file", "ok": True, "error": "", "loaded": False}
+
+
+def store_read(key):
+    """Raises on any failure, so a broken read can never be mistaken for 'nothing saved yet'."""
+    if DATABASE_URL:
+        _init_db()
+        conn = _db(); cur = conn.cursor()
+        cur.execute("SELECT value FROM tracker_state WHERE key=%s", (key,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row[0] if row else None
+    p = os.path.join(DATA_DIR, f"{key}.json")
+    return open(p).read() if os.path.exists(p) else None
+
+
+def store_get(key):
+    try:
+        return store_read(key)
+    except Exception as e:
+        print(f"[Store] read error {key}: {e}")
+        return None
+
+
+def store_set(key, value):
+    try:
+        if DATABASE_URL:
+            _init_db()
+            conn = _db(); cur = conn.cursor()
+            cur.execute("INSERT INTO tracker_state (key,value,updated_at) VALUES (%s,%s,NOW()) "
+                        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()", (key, value))
+            conn.commit(); cur.close(); conn.close()
+        else:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            tmp = os.path.join(DATA_DIR, f"{key}.json.tmp")
+            open(tmp, "w").write(value)
+            os.replace(tmp, os.path.join(DATA_DIR, f"{key}.json"))
+        STORAGE["ok"] = True; STORAGE["error"] = ""
+    except Exception as e:
+        STORAGE["ok"] = False; STORAGE["error"] = str(e)[:200]
+        print(f"[Store] write error {key}: {e}")
+
+
+# ── State ────────────────────────────────────────────────────────────────────
+LOCK = threading.RLock()
+HISTORY = []          # newest last
+SINCE = {}            # cfg -> time tracking began
+STATE = {"snap": None, "why": "starting…", "last_bar": None, "updated": 0}
+
+
+def save_history():
+    if not STORAGE["loaded"]:      # never overwrite saved history with an empty list after a failed load
+        return
+    store_set("history", json.dumps(HISTORY[-MAX_HISTORY:]))
+
+
+def save_since():
+    if not STORAGE["loaded"]:
+        return
+    store_set("since", json.dumps(SINCE))
+
+
+# ── Indicators ──────────────────────────────────────────────────────────────
+def composite(closes):
+    """Same maths as the TradingView composite."""
+    if len(closes) < ZLEN:
+        return None
+    w = closes[-ZLEN:]
+    mean = sum(w) / len(w)
+    sd = (sum((x - mean) ** 2 for x in w) / len(w)) ** 0.5
+    if sd == 0:
+        return None
+    zn = min(100.0, max(0.0, 50 + ((closes[-1] - mean) / sd) * 16.67))
+    last = closes[-1]
+    rank = sum(1 for i in range(LOOKBACK) if last > closes[-1 - i])
+    return (zn + rank / LOOKBACK * 100) / 2
+
+
+def colour(v):
+    if v >= HIGH: return "Red"
+    if v >= 55: return "Orange"
+    if v >= 45: return "Grey"
+    if v >= LOW: return "Green"
+    return "Cyan"
+
+
+def ema(closes, period):
+    k = 2 / (period + 1)
+    e = sum(closes[:period]) / period
+    for c in closes[period:]:
+        e = (c - e) * k + e
+    return e
+
+
+def wpr(highs, lows, closes, length):
+    """Orion's Williams %R (length 200, 30m): typical price (H+L+C)/3, last `length` candles. -100 (low) .. 0 (high)."""
+    hh, ll = max(highs[-length:]), min(lows[-length:])
+    tp = (highs[-1] + lows[-1] + closes[-1]) / 3
+    return -50.0 if hh == ll else (hh - tp) / (hh - ll) * -100
+
+
+# Blocked combos: (side, 4H, 30m, 5m now, reason, date added). Also listed on the Blocked tab.
+# Blocked combos: (side, 4H, 30m, 5m now). A setup/alignment in this direction is never logged or alerted in that state.
+# Add more rows here as impossible/poor states are identified.
+BLOCKED = [
+    ("short", "*", "*", "Cyan", "5m already at the floor: shorting a move that's already done", "24 Oct"),
+    ("long", "*", "*", "Red", "5m already at the top: mirror of the short block", "24 Oct"),
+    ("short", "Cyan", "Green", "Green", "4H Cyan / 30m Green: shorts only allowed on a Grey or Orange 5m", "24 Oct"),
+    ("short", "Cyan", "Green", "Cyan", "4H Cyan / 30m Green: shorts only allowed on a Grey or Orange 5m", "24 Oct"),
+    ("short", "Red", "Red", "Red", "All Red: no trade either way (logged as a count only)", "24 Oct"),
+    ("long", "Red", "Red", "Red", "All Red: no trade either way (logged as a count only)", "24 Oct"),
+    ("short", "Green", "Green", "Orange", "5m overshoot above two Green timeframes: no trade either way", "24 Oct"),
+    ("long", "Green", "Green", "Orange", "5m overshoot above two Green timeframes: no trade either way", "24 Oct"),
+    ("short", "Cyan", "Cyan", "Cyan", "All Cyan: no trade either way (logged as a count only)", "24 Oct"),
+    ("long", "Cyan", "Cyan", "Cyan", "All Cyan: no trade either way (logged as a count only)", "24 Oct"),
+    ("long", "Red", "Orange", "Orange", "Opposite side of the Short A++ state", "24 Oct"),
+]
+
+
+# Conditional blocks, judged on live context rather than colours alone: (side, condition text, reason, date added).
+SHORT_GATE_WPR = float(os.environ.get("STAIRCASE_SHORT_GATE_WPR", "-25"))
+LONG_GATE_WPR = float(os.environ.get("STAIRCASE_LONG_GATE_WPR", "-75"))   # mirror of the short line (-25 <-> -75)
+BLOCKED_IF = [
+    ("long", f"price above the 30m midline AND 5m WPR above {LONG_GATE_WPR:g}",
+     "Don't long inside an already heavy uptrend: only the very bottom of it (5m WPR at or below the line, or price below the 30m midline)", "25 Oct"),
+    ("short", f"price below the 30m midline AND 5m WPR below {SHORT_GATE_WPR:g}",
+     "Don't short inside an already heavy downtrend: only the very top of it (5m WPR at or above the line, or price above the 30m midline)", "25 Oct"),
+]
+
+
+def short_gated(ctx):
+    """True when a short must not be taken: price below the 30m midline and 5m WPR below the line. Needs both readings."""
+    return bool(ctx) and ctx.get("mid30_side") == "below" and ctx.get("wpr5") is not None and float(ctx["wpr5"]) < SHORT_GATE_WPR
+
+
+def long_gated(ctx):
+    """True when a long must not be taken: price above the 30m midline and 5m WPR above the line."""
+    return bool(ctx) and ctx.get("mid30_side") == "above" and ctx.get("wpr5") is not None and float(ctx["wpr5"]) > LONG_GATE_WPR
+
+
+def is_blocked(side, h, m, l):
+    """True if (side, 4H, 30m, 5m now) matches a BLOCKED row; "*" in a row matches any colour."""
+    return any(b[0] == side and all(x in ("*", y) for x, y in zip(b[1:4], (h, m, l))) for b in BLOCKED)
+
+
+def blocked(side, cols):
+    return is_blocked(side, cols[0], cols[1], cols[3])
+
+
+def detect(cols, rules=None):
+    return [(d, L) for (d, L, rh, rm, rp, rl) in (rules or RULES)
+            if tuple(cols) == (rh, rm, rp, rl) and not blocked(d, cols)]
+
+
+def closest(cols, rules=None):
+    h, m, p, l = cols
+    out = []
+    for d, L, rh, rm, rp, rl in (rules or RULES):
+        if is_blocked(d, rh, rm, rl): continue
+        miss = []
+        if h != rh: miss.append(f"{LABELS[0]} must be {rh} (now {h})")
+        if m != rm: miss.append(f"{LABELS[1]} must be {rm} (now {m})")
+        if (p, l) != (rp, rl): miss.append(f"{LABELS[2]} {rp} → {rl} (now {p} → {l})")
+        if len(miss) == 1:
+            out.append({"direction": d, "letter": L, "missing": miss[0]})
+    return out
+
+
+def aligned_colour(cols):
+    h, m, _p, l = cols
+    return h if (h == m == l and h in ALIGN_COLOURS) else None
+
+
+# ── Binance (REST only) ──────────────────────────────────────────────────────
+_cache = {}   # (interval, n) -> (fetched_at, candles)
+_TTL = {TF_L: 4, TF_M: 25, TF_H: 55, CTX_TF: 55}
+
+
+def get_klines(interval, n):
+    """Closed candles, oldest first, or (None, reason)."""
+    hit = _cache.get((interval, n))
+    if hit and time.time() - hit[0] < _TTL.get(interval, 30):
+        return hit[1], "ok"
+    try:
+        r = requests.get(f"{FUTURES_BASE}/fapi/v1/klines",
+                         params={"symbol": SYMBOL, "interval": interval, "limit": n + 1}, timeout=10)
+        r.raise_for_status()
+        now_ms = int(time.time() * 1000)
+        closed = [x for x in r.json() if x[6] < now_ms]
+        _cache[(interval, n)] = (time.time(), closed)
+        return closed, "ok"
+    except Exception as e:
+        return None, f"{interval}: {e}"
+
+
+def get_mark():
+    try:
+        r = requests.get(f"{FUTURES_BASE}/fapi/v1/premiumIndex", params={"symbol": SYMBOL}, timeout=10)
+        r.raise_for_status()
+        return float(r.json()["markPrice"])
+    except Exception as e:
+        return None
+
+
+MID_LEN = int(os.environ.get("STAIRCASE_MID_LEN", "100"))   # bars in the range, same as the overlay's "Mid line range"
+
+
+def midline(tf, price):
+    """Midpoint of the highest high / lowest low of the last MID_LEN closed bars (plus the live price),
+    like the overlay's mid line. tf = the timeframe whose bars make up the range."""
+    k, _ = get_klines(tf, MID_LEN)
+    if not k or len(k) < MID_LEN:
+        return None
+    k = k[-MID_LEN:]
+    hh = max(max(float(x[2]) for x in k), price); ll = min(min(float(x[3]) for x in k), price)
+    return (hh + ll) / 2
+
+
+def get_context(price):
+    out = {}
+    k, _ = get_klines(CTX_TF, 500)
+    if k and len(k) >= 201:
+        hi = [float(x[2]) for x in k]; lo = [float(x[3]) for x in k]; cl = [float(x[4]) for x in k]
+        e = ema(cl, 200)
+        out.update({"wpr": round(wpr(hi, lo, cl, WPR_LEN), 1), "ema200": round(e, 1),
+                    "ema_side": "above" if price > e else "below",
+                    "ema_dist": round((price - e) / e * 100, 2), "ctx_tf": CTX_TF})
+    k5w, _ = get_klines("5m", 500)
+    if k5w and len(k5w) >= WPR_LEN:
+        out["wpr5"] = round(wpr([float(x[2]) for x in k5w], [float(x[3]) for x in k5w], [float(x[4]) for x in k5w], WPR_LEN), 1)
+    for tf, nm in (("30m", "mid30"), ("5m", "mid5")):
+        m = midline(tf, price)
+        if m:
+            out[nm] = round(m, 1); out[nm + "_side"] = "above" if price > m else "below"
+            out[nm + "_dist"] = round((price - m) / m * 100, 2)
+    return out
+
+
+# ── Telegram (optional, plain text, no buttons — Orion keeps the Take buttons) ──
+def tg(text):
+    if not (TG_ALERTS and TG_TOKEN and TG_CHAT):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        print(f"[Telegram] {e}")
+
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+def add_entry(kind, key, bar, price, cols, vals, ctx):
+    if skipday():          # Saturday etc.: never log
+        return None
+    with LOCK:
+        if any(e["key"] == key and e.get("bar") == bar for e in HISTORY[-60:]):
+            return None
+        sides = [ALIGN_DIR[key[6:]]] if kind == "align" else [key.split("_")[0]]
+        obs = kind == "align" and blocked(sides[0], cols)   # blocked alignment: logged and counted, never a trade
+        if obs: sides = []
+        e = {"t": time.time(), "bar": bar, "kind": kind, "key": key, "price": price,
+             "cols": list(cols), "vals": [round(v, 1) for v in vals], "cfg": cfg_sig(),
+             "tp_pct": TP_PCT, "tp2_pct": TP2_PCT, "sl_pct": SL_PCT, "res": {s: None for s in sides}, "ended": None}
+        if obs: e["obs"] = True
+        e.update(ctx or {})
+        if key in POCKET_KEYS:
+            e["pocket"] = in_pocket(e)
+        HISTORY.append(e)
+        del HISTORY[:-MAX_HISTORY]
+        save_history()
+    return e
+
+
+def evaluate(bar, price, cols, vals, ctx):
+    """Called once per newly closed fast-TF candle."""
+    h, m, p, l = cols
+    ctx_line = (f"\nWPR {ctx['wpr']:.1f} · price {ctx['ema_side']} EMA200 ({ctx['ctx_tf']}, {ctx['ema_dist']:+.2f}%)" if ctx.get("wpr") is not None else "") if ctx else ""
+    if ctx and ctx.get("mid30") is not None:
+        ctx_line += f"\nPrice {ctx['mid30_side']} the 30m midline ({ctx['mid30_dist']:+.2f}%)"
+    gate = {"short": short_gated(ctx), "long": long_gated(ctx)}
+    for d, L in detect(cols) + detect(cols, UNTESTED):
+        if gate[d]:
+            print(f"[Tracker] {d} {L} blocked by the midline/WPR filter (5m WPR {ctx.get('wpr5')}, {ctx.get('mid30_side')} 30m midline)")
+    for d, L in detect(cols):
+        if gate[d]: continue
+        ent = add_entry("setup", f"{d}_{L}", bar, price, cols, vals, ctx)
+        if ent:
+            print(f"[Tracker] FIRE {d} {L} @ {price}" + (" (off-zone)" if offzone(ent) else ""))
+            if not offzone(ent): tg(f"{'🟢' if d == 'long' else '🔴'} <b>{d.upper()} {L}</b> · BTC {price:,.0f}\n"
+               f"{LABELS[0]} {EMOJI[h]} · {LABELS[1]} {EMOJI[m]} · {LABELS[2]} {EMOJI[p]}→{EMOJI[l]}\n"
+               f"<i>{NOTES[(d, L)]}</i> (tracker log){ctx_line}")
+    for d, L in detect(cols, UNTESTED):
+        if gate[d]: continue
+        if add_entry("untested", f"{d}_{L}", bar, price, cols, vals, ctx):
+            print(f"[Tracker] UNTESTED FIRE {d} {L} @ {price}")
+    ac = aligned_colour(cols)
+    if ac and gate[ALIGN_DIR[ac]]:
+        ac = None
+    with LOCK:
+        open_al = next((e for e in reversed(HISTORY[-200:]) if e["kind"] == "align" and e.get("ended") is None), None)
+        if open_al and open_al["key"] != f"align_{ac}":
+            open_al["ended"] = time.time()
+            save_history()
+        if ac and not (open_al and open_al["key"] == f"align_{ac}"):
+            ent = add_entry("align", f"align_{ac}", bar, price, cols, vals, ctx)
+            if ent:
+                print(f"[Tracker] ALIGNED {ac} @ {price}" + (" (off-zone)" if offzone(ent) else ""))
+                if not offzone(ent) and not ent.get("obs"): tg(f"{EMOJI[ac]} <b>ALL {ac.upper()}</b> · {'/'.join(LABELS)} aligned · BTC {price:,.0f}{ctx_line}")
+
+
+def resolve_all():
+    """Settle open logs with 1m candles after the fire.
+    loss = SL first. tp1 = TP1 hit (R = TP1/SL), upgraded to tp2 if TP2 is then hit before the stop.
+    After TP1 the stop is the original SL (or entry if STAIRCASE_BE_AFTER_TP1=true).
+    A candle that touches both the stop and a target counts against you."""
+    with LOCK:
+        pend = [e for e in HISTORY if any(v is None for v in e["res"].values()) and e.get("price")]
+    changed = False
+    for e in pend:
+        try:
+            tp1_pct, sl_pct = float(e["tp_pct"]), float(e["sl_pct"])
+            tp2_pct = float(e.get("tp2_pct", TP2_PCT))
+            entry = float(e["price"])
+            start = e.get("scan") or int((e["t"] // 60 + 1) * 60 * 1000)
+            r = requests.get(f"{FUTURES_BASE}/fapi/v1/klines",
+                             params={"symbol": SYMBOL, "interval": "1m", "startTime": int(start), "limit": 1500}, timeout=10)
+            r.raise_for_status()
+            now_ms = int(time.time() * 1000)
+            last_close = None
+            t1 = e.setdefault("tp1", {})
+            for x in r.json():
+                if x[6] >= now_ms:
+                    break
+                hi, lo = float(x[2]), float(x[3])
+                at = x[6] / 1000
+                last_close = float(x[4]); e["scan"] = x[0] + 60000; changed = True
+                for side, cur in e["res"].items():
+                    if cur is not None:
+                        continue
+                    short = side == "short"
+                    lvl = (lambda p: entry * (1 - p / 100)) if short else (lambda p: entry * (1 + p / 100))
+                    sl = entry * (1 + sl_pct / 100) if short else entry * (1 - sl_pct / 100)
+                    hit1 = lo <= lvl(tp1_pct) if short else hi >= lvl(tp1_pct)
+                    hit2 = lo <= lvl(tp2_pct) if short else hi >= lvl(tp2_pct)
+
+                    def done(outcome, rr):
+                        e["res"][side] = {"outcome": outcome, "r": rr, "at": at}
+                        if outcome in ("tp1", "tp2"):
+                            e["res"][side]["t1"] = t1.get(side, at)
+
+                    if side not in t1:
+                        hit_sl = hi >= sl if short else lo <= sl
+                        if hit_sl:
+                            done("loss", -1.0)
+                        elif hit1:
+                            t1[side] = at
+                            if hit2:
+                                done("tp2", round(tp2_pct / sl_pct, 2))
+                    else:
+                        stop = entry if BE_AFTER_TP1 else sl
+                        stop_hit = hi >= stop if short else lo <= stop
+                        if stop_hit:
+                            done("tp1", round(tp1_pct / sl_pct, 2))
+                        elif hit2:
+                            done("tp2", round(tp2_pct / sl_pct, 2))
+                if all(v is not None for v in e["res"].values()):
+                    break
+            if time.time() - e["t"] > TIMEOUT_SECS:
+                ref = last_close if last_close is not None else entry
+                for side, cur in e["res"].items():
+                    if cur is None:
+                        if side in t1:
+                            e["res"][side] = {"outcome": "tp1", "r": round(tp1_pct / sl_pct, 2), "at": time.time(), "t1": t1[side]}
+                        else:
+                            mv = (entry - ref) / entry * 100 if side == "short" else (ref - entry) / entry * 100
+                            e["res"][side] = {"outcome": "timeout", "r": round(mv / sl_pct, 2), "at": time.time()}
+                        changed = True
+        except Exception as ex:
+            print(f"[Tracker] resolve error: {ex}")
+    if changed:
+        with LOCK:
+            save_history()
+
+
+# ── Weekly summary ───────────────────────────────────────────────────────────
+DIGEST_ON   = os.environ.get("STAIRCASE_WEEKLY_DIGEST", "true").lower() == "true"
+DIGEST_DAY  = int(os.environ.get("STAIRCASE_DIGEST_DAY", "6"))     # 0 = Monday ... 6 = Sunday (UK time)
+DIGEST_HOUR = int(os.environ.get("STAIRCASE_DIGEST_HOUR", "20"))   # UK hour
+_new = lambda: {"fires": 0, "n": 0, "tp1": 0, "both": 0, "sl": 0, "to": 0, "open": 0, "r": 0.0}
+
+
+def _add(a, res):
+    if res is None:
+        a["open"] += 1
+        return
+    a["n"] += 1; a["r"] += float(res["r"])
+    o = res["outcome"]
+    if o == "tp2": a["both"] += 1
+    elif o in ("tp1", "win"): a["tp1"] += 1
+    elif o == "loss": a["sl"] += 1
+    else: a["to"] += 1
+
+
+def _label(k):
+    if k.startswith("align_"):
+        c = k[6:]
+        return f"All {c} ({ALIGN_DIR[c]})"
+    d, L = k.split("_")
+    return f"{d.title()} {L}"
+
+
+def build_digest(now=None, days=7):
+    """Returns (html for Telegram, plain text) for the last `days` days on the current settings."""
+    now = now or time.time(); cfg = cfg_sig(); since = now - days * 86400
+    per, tot, by_ema = {}, _new(), {}
+    plus, rest, offt = _new(), _new(), {"long": _new(), "short": _new()}
+    unt = {}
+    with LOCK:
+        for e in HISTORY:
+            if hidden(e) or e.get("cfg") != cfg or e["t"] < since:
+                continue
+            if (float(e["tp_pct"]), float(e["sl_pct"]), float(e.get("tp2_pct", TP2_PCT))) != (TP_PCT, SL_PCT, TP2_PCT):
+                continue
+            if e["kind"] == "untested":
+                if not offzone(e):
+                    for side, res in e["res"].items():
+                        _add(unt.setdefault(e["key"], _new()), res); unt[e["key"]]["fires"] += 1
+                continue
+            if offzone(e):
+                for side, res in e["res"].items():
+                    _add(offt[side], res)
+                continue
+            a = per.setdefault(e["key"], _new()); a["fires"] += 1; tot["fires"] += 1
+            for side, res in e["res"].items():
+                _add(a, res); _add(tot, res)
+                if e["kind"] == "setup":
+                    _add(plus if e["key"].endswith("+") else rest, res)
+                if e.get("ema_side"):
+                    _add(by_ema.setdefault((side, e["ema_side"]), _new()), res)
+    fmt = lambda a: f"{a['tp1']}/{a['both']}/{a['sl']}"
+    avg = lambda a: f"{a['r']/a['n']:+.2f}R" if a["n"] else "-"
+    uk = datetime.fromtimestamp(now, ZoneInfo("Europe/London"))
+    start = datetime.fromtimestamp(since, ZoneInfo("Europe/London"))
+    lines = [f"Staircase weekly · {start.strftime('%d %b')} to {uk.strftime('%d %b')}",
+             f"TP1 {TP_PCT}% / TP2 {TP2_PCT}% / SL {SL_PCT}%", ""]
+    if not tot["fires"]:
+        lines.append("No fires this week.")
+    else:
+        lines.append(f"{tot['fires']} logged, {tot['n']} finished, {tot['open']} still open")
+        if tot["n"]:
+            lines.append(f"{tot['tp1']} TP1 only · {tot['both']} TP1+TP2 · {tot['sl']} SL" + (f" · {tot['to']} timed out" if tot["to"] else ""))
+            lines.append(f"Total {tot['r']:+.1f}R · average {avg(tot)}")
+        lines += ["", "⭐ Reminder: your theory is that the + setups (A+, B+) are the real signals, best R and best confirmation. They are still tests, so check them here:"]
+        for nm, a in (("+ setups", plus), ("All other setups", rest)):
+            lines.append(f"{nm}: {a['n']} finished, {fmt(a)}, {avg(a)}" if a["n"] else f"{nm}: nothing finished yet")
+        lines += ["", "By trigger (TP1 only / both / SL):"]
+        rows = []
+        for k in sorted(per, key=lambda k: (k.startswith("align_"), k)):
+            a = per[k]
+            rows.append(f"{_label(k):<20}{a['fires']:>3} fired  {fmt(a):<7} {avg(a):>7}" + (f"  +{a['open']} open" if a["open"] else ""))
+        lines += ["\x00" + r for r in rows]
+        done = [(k, a) for k, a in per.items() if a["n"] >= 3]
+        if done:
+            best = max(done, key=lambda t: t[1]["r"] / t[1]["n"]); worst = min(done, key=lambda t: t[1]["r"] / t[1]["n"])
+            lines += ["", f"Best: {_label(best[0])} {avg(best[1])} ({best[1]['n']} finished)"]
+            if worst[0] != best[0]:
+                lines.append(f"Worst: {_label(worst[0])} {avg(worst[1])} ({worst[1]['n']} finished)")
+            lines.append("(only triggers with 3+ finished trades)")
+        if unt:
+            lines += ["", "Untested setups (kept out of the totals above):"]
+            for k in sorted(unt):
+                a = unt[k]
+                lines.append(f"{_label(k)}: {a['fires']} fired, {a['n']} finished, {fmt(a)}, {avg(a)}" + (f", {a['open']} open" if a["open"] else ""))
+        if ZONE_FILTER and any(offt[sd]["n"] or offt[sd]["open"] for sd in offt):
+            lines += ["", f"Off-zone, not counted above (longs with price above / shorts with price below the {'5m' if ZONE_RANGE == 'mid5' else '30m'} midline):"]
+            for sd, nm in (("long", "Longs above the midline"), ("short", "Shorts below the midline")):
+                a = offt[sd]
+                if a["n"] or a["open"]:
+                    lines.append(f"{nm}: {a['n']} finished, {fmt(a)}, {avg(a)}" + (f", {a['open']} open" if a["open"] else ""))
+        if by_ema:
+            lines += ["", "By price vs EMA200 at the fire:"]
+            for (side, es) in sorted(by_ema):
+                a = by_ema[(side, es)]
+                if a["n"]:
+                    lines.append(f"{side.title()}s {es} EMA200: {a['n']} finished, {fmt(a)}, {avg(a)}")
+    text = "\n".join(lines)
+    plain = text.replace("\x00", "")
+    html_lines = []
+    block = []
+    for ln in lines:
+        if ln.startswith("\x00"):
+            block.append(ln[1:])
+            continue
+        if block:
+            html_lines.append("<pre>" + "\n".join(block) + "</pre>"); block = []
+        html_lines.append(ln)
+    if block:
+        html_lines.append("<pre>" + "\n".join(block) + "</pre>")
+    html = "📊 <b>" + html_lines[0] + "</b>\n" + "\n".join(html_lines[1:])
+    return html, plain
+
+
+WEEKLY = []   # saved weekly reports, newest last: {key, t, text}
+
+
+def maybe_weekly():
+    """Once a week (default Sunday 20:00 UK): save the report for the page, and send it to Telegram if configured."""
+    if not DIGEST_ON or not STORAGE["loaded"]:
+        return
+    uk = datetime.now(ZoneInfo("Europe/London"))
+    if uk.weekday() != DIGEST_DAY or uk.hour < DIGEST_HOUR:
+        return
+    key = uk.strftime("%G-W%V")
+    if store_get("digest_sent") == key:
+        return
+    html, plain = build_digest()
+    WEEKLY.append({"key": key, "t": time.time(), "text": plain})
+    del WEEKLY[:-52]
+    store_set("weekly_reports", json.dumps(WEEKLY))
+    store_set("digest_sent", key)
+    print("[Tracker] weekly report saved")
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": html[:4000], "parse_mode": "HTML"}, timeout=10)
+        except Exception as e:
+            print(f"[Tracker] digest telegram error: {e}")
+
+
+# ── Refresh + loop ───────────────────────────────────────────────────────────
+def refresh():
+    """Read the market, build the live snapshot. Returns (bar, price, cols, vals, ctx) or None."""
+    k5, s5 = get_klines(TF_L, ZLEN + 3)
+    k4, s4 = get_klines(TF_H, ZLEN)
+    k30, s30 = get_klines(TF_M, ZLEN)
+    mp = get_mark()
+    if not (k5 and k4 and k30 and mp):
+        bad = [s for s, v in ((s5, k5), (s4, k4), (s30, k30)) if not v]
+        STATE["why"] = "no data: " + ("; ".join(bad) if bad else "price")
+        return None
+    c5 = [float(x[4]) for x in k5]
+    cur5, prev5 = composite(c5), composite(c5[:-1])
+    h = composite([float(x[4]) for x in k4] + ([mp] if LIVE_HIGH else []))
+    m = composite([float(x[4]) for x in k30] + ([mp] if LIVE_MID else []))
+    if None in (cur5, prev5, h, m):
+        STATE["why"] = "not enough candle history yet"
+        return None
+    cols = (colour(h), colour(m), colour(prev5), colour(cur5))
+    live5 = composite(c5 + [mp])
+    ctx = get_context(mp)
+    now = time.time(); step = TF_SECS.get(TF_L, 300)
+    STATE.update(why="", updated=now, snap={
+        "price": mp, "h": h, "m": m, "l": cur5, "cols": list(cols), "live5": live5,
+        "live5_col": colour(live5) if live5 is not None else None,
+        "next_close": now - (now % step) + step, "tfs": list(LABELS),
+        "params": [LOOKBACK, ZLEN, HIGH, LOW], "live": [LIVE_HIGH, LIVE_MID], "firing": [] if skipday(now) else [{"direction": d, "letter": L} for d, L in detect(cols)],
+        "close": [] if skipday(now) else closest(cols),
+        "ufiring": [] if skipday(now) else [{"direction": d, "letter": L} for d, L in detect(cols, UNTESTED)],
+        "uclose": [] if skipday(now) else closest(cols, UNTESTED), "aligned": None if skipday(now) else aligned_colour(cols), "ctx": ctx, "skip": skipday(now)})
+    return k5[-1][0], mp, cols, (h, m, cur5), ctx
+
+
+def loop():
+    last_resolve = 0.0
+    while True:
+        try:
+            time.sleep(5)
+            if not STORAGE["loaded"] and time.time() - loop.last_load > 60:
+                loop.last_load = time.time()
+                load_all()
+            res = refresh()
+            if res:
+                bar = res[0]
+                if STATE["last_bar"] is None:           # first read ever: remember the bar, don't log a stale one
+                    STATE["last_bar"] = bar
+                    store_set("last_bar", str(bar))
+                elif bar != STATE["last_bar"]:
+                    STATE["last_bar"] = bar
+                    store_set("last_bar", str(bar))
+                    evaluate(*res)
+            if time.time() - last_resolve > 60:
+                last_resolve = time.time()
+                resolve_all()
+                maybe_weekly()
+        except Exception as e:
+            print(f"[Tracker] loop error: {e}")
+            time.sleep(30)
+
+
+loop.last_load = 0.0
+_started = False
+
+
+def load_all():
+    """Load saved state. Until this succeeds nothing is written, so a database hiccup can never wipe history."""
+    try:
+        h = store_read("history"); sn = store_read("since"); wr = store_read("weekly_reports"); lb = store_read("last_bar")
+        loaded = json.loads(h)[-MAX_HISTORY:] if h else []
+        since = json.loads(sn) if sn else {}
+        weekly = json.loads(wr)[-52:] if wr else []
+    except Exception as e:
+        STORAGE["ok"] = False; STORAGE["error"] = f"could not load saved history: {e}"[:200]
+        print(f"[Tracker] load error (writes paused until it loads): {e}")
+        return False
+    with LOCK:
+        sig = lambda e: (e["key"], e.get("bar"), round(float(e["t"])))
+        have = {sig(e) for e in loaded}
+        extra = [e for e in HISTORY if sig(e) not in have]
+        HISTORY[:] = (loaded + extra)[-MAX_HISTORY:]
+        for k, v in since.items():
+            SINCE.setdefault(k, v)
+        if not WEEKLY:
+            WEEKLY.extend(weekly)
+        if lb and STATE["last_bar"] is None:
+            STATE["last_bar"] = int(lb)
+        # alignments count only in their own direction (Red/Orange short, Green/Cyan long): drop any other leg
+        changed = bool(extra)
+        for e in HISTORY:
+            if e.get("key") in ("long_A", "short_A"):      # Long/Short A were renamed A++
+                e["key"] += "++"; changed = True
+            if e.get("key") in POCKET_KEYS and e.get("pocket") is None and e.get("wpr") is not None:
+                e["pocket"] = in_pocket(e); changed = True
+            if e.get("kind") == "align" and not e.get("obs"):
+                want = ALIGN_DIR.get(e["key"][6:])
+                if want and set(e["res"]) != {want}:
+                    e["res"] = {want: e["res"].get(want)}
+                    changed = True
+        STORAGE["loaded"] = True; STORAGE["ok"] = True; STORAGE["error"] = ""
+        if cfg_sig() not in SINCE:
+            SINCE[cfg_sig()] = time.time()
+            save_since()
+        if changed:
+            save_history()
+    print(f"[Tracker] loaded {len(HISTORY)} saved entries from {STORAGE['mode']}")
+    return True
+
+
+def start():
+    global _started
+    if _started:
+        return
+    _started = True
+    for attempt in range(3):
+        if load_all():
+            break
+        time.sleep(2)
+    if not DATABASE_URL:
+        print(f"[Tracker] WARNING: no DATABASE_URL, saving to {DATA_DIR} (lost on redeploy unless it is a volume)")
+    threading.Thread(target=loop, daemon=True).start()
+    print(f"[Tracker] started: {'/'.join(LABELS)}, {SYMBOL}, TP1 {TP_PCT}% / TP2 {TP2_PCT}% / SL {SL_PCT}%")
+
+
+# ── Web ─────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+_fails = []
+ICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAAG10lEQVR42u3dO2xkVxnA8e8759w7D8/EGTvJSpuH5QUpgiChlDQRUiSooKAEItEgihSIiCIS0CAoaCkiKKgJrwKIWNGgKCvRpUCb5RXLq2XZZSWvbewdj2fm3nM+irE3jhSByL3XO3f1/1fb7Njj+5sz51zPOdbV0QUh+qAcPwICB4GDwEHgIHAQOAgcBA4CB4GDCBwEDgIHgYPAQeAgcFDLC809tNb6aMa1eghwqIhTFZHSLJppTdfVqyqXq9U4vGppdliWyWwtyx4NIYnVclGPYirN8NFWHEH1oCyHwX/u8bUX10bPDwfreUiVx41kshLcV6/9/cr+wTCEaLzDtArH4gW9WxSfWR9959LGJwZ9VZklq+W1vsARVEHR1pFjbvbq5tOvbDwlIv8uSxHRmmYJyaQwhot24giqu0Xx6uYz3/3Ixq3ZTEV8rXNHrXvhQ+eEw6selOVn10evbDx5azZ3rCkeolzF13RpNvT+25c2VESE1QQ47v9n1aMYX1hbfW7YH8fkGTXAcXbkSCYvro2cqHEPExxnZRSWRll4fjiYpeQYNsBxtmgyDG49zyL3LsHxgTchuGUJjv/2/kLgIHAQgYPAQeAgcBA4CBwEDgIHgYPAQeAgAgeBg8BB4CBwEDioTYVWfJeLTzCriGqzH1nls9LtwxFUVaRMUpQSmzTonbD/pk04VOSwLItkqz0ddbRMjQweJqIqR1MrIj5agmNxcsvX/vzulZ3D119+5NMfC4fH5hqYKZnJSq5f/NH4zb8Uj/Q0Jmy0Z+Qok632dH2owYl3jSgcdDXzTDtaOOeQ0zlHESVZIziKEhltX61oI3OCxYPT2bjPQeAgcBA4CBwEDgIHgYPAQeAgcBCBg8BB4CBwEDgIHAQOAgeBg8BBBA4CB4GDwEHgIHDQkhf4Edzv/ibqhrbjvveFDByte6E4UZWULEZr9HwO1Xb8/W5wnF4wkcNjm5fW6+b9vm8Ux3xepJTA0Y6SyUpHX/rx0VvXpl956fOXNjems5k28Oo2szzPf/qz32xt3+h2OrbcbzDgeN/IUZyMHD3nXXM4vG/HOgAc75tzyMmcI8WYGsIRY2JC2vrVSkNzxhadH8R9DgIHgYPAQeAgcBA4CBwEDgIHgYMIHAQOAgeBg8BB4CBwEDgIHAQOInAQOAgcBA4CB4GDljz2yj6gtPlds5X3a4Pj3Mdqp6pqZTIXTRrbb2+ivupmcHCcd9PpvCxjGHZDv9fo4S1pMrcyiYKjDZ0c6/OL327/bfvZ1740+NRmvDdT18CbSzK3km9//ef3/rjtBx1LBo62jRyjvnrfFI5BrsFXfNcCx4ObcxTRyijN4LAiMiFt+WqloQOEaloKcZ+DwEHgIHAQOAgcBA4CB4GDwEHgIAIHgYPAQeAgcBA4CBwEDgIHgeP/TfG1nKlU/1x7pSurKrNkk5SUi7FcMtSKmI7mFX18eBwmkqvenRfvjI86zrXmzyw/9Jlp7ue3D463drQbqlyWaiOHaBJ7c+/AqUBjWWwkc91s/PY/yt2xC77K1qZKOKJZ3/s/7O3fns27zuFjSSYbFtP+5WvqXMVNb5VwmEjHuZvT2Q9v3B4EXyZ4POhho4h+1N9/4+rhW++64YffQl3PaiWaPZqFn9z61y/v3L3YzedMPR6ojDDqT7d2bn7/snZC9Xf6OtahJrlz39q6/sbO3hN5piKlWeJaneMM1GKymML6yvT63evf/FW5P3F5WIqN1EkkV71Xxi9f/es3Np58+emLj2XZcUqzlJKZSKXVVDJJp+ffLP6dTLTu0ensV7HTmriI7z2snT6ZyqtWzYPvZhbT3q//dPN7l8v9iR90LNbw8qxnl30SyVSD6g+u3/z93f0vXHjshdHqZq87CKHiyUbJZBBcUBWRfq55VwdRvKsfR7erwYmYZFnW6eTJTOve/25mnU6uqmLiuplb6ViySudzqFoR57cPxm/f2P/dO4dXtrQT6pIhIro6ulDj8/eqkxinKa2G8NF+7/E8K8208mNeGx/tzcpPPhNGKxqbecfyTq7+M+7ei09dfKLX66ZmJtfq9M6dncl4svLxi361J7HCsUwm4jRN5sdbO+XuWL1zg45YDefENYVjMYtxqqXZNKXqMhY/hJ5zwelkVvGMq//xVfq5Bi/zeZlS0gbu3KiImWRZcN6n47nFpNWejYmpc64TNPNiZnWDrh/HWSWqWnXScTLsm4k4bfZ0xpTERFRVpal7eipysp5z9TwVW0xfmvl2GzzZJ0mdQ9xiZnAON2KtySP+7Kz3pV8G8StVAgeBg8BB4CBwEDgIHAQOAgeBgwgcBA4CB4GDwEHgIHBQ2/sPmPiwpGNJ3gAAAAAASUVORK5CYII="
+
+
+def auth():
+    if not TOKEN:
+        return None
+    return hmac.compare_digest(flask_request.headers.get("X-Secret", ""), TOKEN)
+
+
+def gate():
+    """Returns an error response or None if the request is allowed."""
+    now = time.time()
+    _fails[:] = [t for t in _fails if now - t < 300]
+    if len(_fails) >= 10:
+        return jsonify({"error": "Too many attempts"}), 429
+    ok = auth()
+    if ok is None:
+        return jsonify({"error": "STAIRCASE_TOKEN not set"}), 503
+    if not ok:
+        _fails.append(now)
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
+@app.route("/")
+def root():
+    return redirect("/staircase")
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "running", "updated": STATE["updated"], "entries": len(HISTORY), "storage": STORAGE})
+
+
+@app.route("/staircase-icon.png")
+def icon():
+    resp = app.response_class(base64.b64decode(ICON_B64), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/staircase")
+def page():
+    resp = app.response_class(PAGE, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+EMA_EDGES = [-3, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3]
+MID_EDGES = [-1.5, -1, -0.5, -0.25, 0, 0.25, 0.5, 1, 1.5]
+
+
+def dist_bucket(d, edges):
+    import bisect
+    i = bisect.bisect_right(edges, d)
+    if i == 0:
+        return f"below {edges[0]:g}%"
+    if i == len(edges):
+        return f"above +{edges[-1]:g}%"
+    return f"{edges[i-1]:+g}% to {edges[i]:+g}%"
+
+
+def dist_labels(edges):
+    return [f"below {edges[0]:g}%"] + [f"{edges[i-1]:+g}% to {edges[i]:+g}%" for i in range(1, len(edges))] + [f"above +{edges[-1]:g}%"]
+
+
+def ema_labels():
+    return dist_labels(EMA_EDGES)
+
+
+def _dist_stats(cfg, field, edges):
+    """Results of logged trades grouped by how far price was from a reference line at fire time.
+    out[side]["__above"/"__below"] = whole side of the line, plus out[side][bucket] = distance buckets."""
+    out = {"long": {}, "short": {}}
+    for e in HISTORY:
+        d = e.get(field)
+        if e["kind"] == "untested" or hidden(e) or d is None or e.get("cfg") != cfg or (float(e["tp_pct"]), float(e["sl_pct"]), float(e.get("tp2_pct", TP2_PCT))) != (TP_PCT, SL_PCT, TP2_PCT):
+            continue
+        d = float(d)
+        for side, res in e["res"].items():
+            for b in (dist_bucket(d, edges), "__above" if d > 0 else "__below"):
+                a = out[side].setdefault(b, {"n": 0, "w": 0, "t2": 0, "l": 0, "to": 0, "r": 0.0, "open": 0})
+                if res is None:
+                    a["open"] += 1
+                else:
+                    a["n"] += 1; a["r"] += float(res["r"])
+                    a["w"] += 1 if res["outcome"] in ("win", "tp1", "tp2") else 0
+                    a["t2"] += 1 if res["outcome"] == "tp2" else 0
+                    a["l"] += 1 if res["outcome"] == "loss" else 0
+                    a["to"] += 1 if res["outcome"] == "timeout" else 0
+    for side in out.values():
+        for a in side.values():
+            a["r"] = round(a["r"] / a["n"], 2) if a["n"] else None
+    return out
+
+
+WPR_ZONES = [("-100 to -95 (extreme low)", -100.01, -95), ("-95 to -80", -95, -80), ("-80 to -50", -80, -50), ("-50 to -25", -50, -25), ("-25 to -5", -25, -5), ("-5 to 0 (extreme high)", -5, 0.01)]
+
+
+def _wpr_stats(cfg, field):
+    """Results grouped by the WPR reading (30m or 5m, length WPR_LEN) at fire time."""
+    out = {"long": {}, "short": {}}
+    for e in HISTORY:
+        w = e.get(field)
+        if hidden(e) or w is None or e.get("cfg") != cfg or (float(e["tp_pct"]), float(e["sl_pct"]), float(e.get("tp2_pct", TP2_PCT))) != (TP_PCT, SL_PCT, TP2_PCT):
+            continue
+        w = float(w)
+        z = next((n for n, lo, hi in WPR_ZONES if lo <= w < hi), None)
+        if z is None: continue
+        for side, res in e["res"].items():
+            a = out[side].setdefault(z, {"n": 0, "w": 0, "t2": 0, "l": 0, "to": 0, "r": 0.0, "open": 0})
+            if res is None:
+                a["open"] += 1
+            else:
+                a["n"] += 1; a["r"] += float(res["r"])
+                a["w"] += 1 if res["outcome"] in ("win", "tp1", "tp2") else 0
+                a["t2"] += 1 if res["outcome"] == "tp2" else 0
+                a["l"] += 1 if res["outcome"] == "loss" else 0
+                a["to"] += 1 if res["outcome"] == "timeout" else 0
+    for side in out.values():
+        for a in side.values():
+            a["r"] = round(a["r"] / a["n"], 2) if a["n"] else None
+    return out
+
+
+def _pocket_stats(cfg):
+    """A++ results split by whether the 30m WPR was inside the pocket when it fired."""
+    out = {"long": {}, "short": {}}
+    for e in HISTORY:
+        if e.get("key") not in POCKET_KEYS or hidden(e) or e.get("cfg") != cfg: continue
+        if (float(e["tp_pct"]), float(e["sl_pct"]), float(e.get("tp2_pct", TP2_PCT))) != (TP_PCT, SL_PCT, TP2_PCT): continue
+        pk = e.get("pocket")
+        if pk is None: continue
+        for side, res in e["res"].items():
+            a = out[side].setdefault("in" if pk else "out", {"n": 0, "w": 0, "t2": 0, "l": 0, "to": 0, "r": 0.0, "open": 0})
+            if res is None:
+                a["open"] += 1
+            else:
+                a["n"] += 1; a["r"] += float(res["r"])
+                a["w"] += 1 if res["outcome"] in ("win", "tp1", "tp2") else 0
+                a["t2"] += 1 if res["outcome"] == "tp2" else 0
+                a["l"] += 1 if res["outcome"] == "loss" else 0
+                a["to"] += 1 if res["outcome"] == "timeout" else 0
+    for side in out.values():
+        for a in side.values():
+            a["r"] = round(a["r"] / a["n"], 2) if a["n"] else None
+    return out
+
+
+def _ema_stats(cfg):
+    return _dist_stats(cfg, "ema_dist", EMA_EDGES)
+
+
+def _stats(cfg, off=False, old=False):
+    """stats[key][side] = {n, w, r, open}; plus _short / _long over every trigger (setups + alignments, each counted separately), and _short_setup / _short_align / _long_setup / _long_align."""
+    stats = {}
+
+    def bump(k, side, res, t0=0):
+        s = stats.setdefault(k, {}).setdefault(side, {"n": 0, "w": 0, "t2": 0, "l": 0, "to": 0, "r": 0.0, "open": 0})
+        if res is None:
+            s["open"] += 1
+        else:
+            s["n"] += 1; s["r"] += float(res["r"]); s["w"] += 1 if res["outcome"] in ("win", "tp1", "tp2") else 0
+            s["t2"] += 1 if res["outcome"] == "tp2" else 0
+            s["l"] += 1 if res["outcome"] == "loss" else 0
+            s["to"] += 1 if res["outcome"] == "timeout" else 0
+            if res.get("t1"):
+                s["tt"] = s.get("tt", 0) + max(0, res["t1"] - t0); s["tn"] = s.get("tn", 0) + 1
+
+    for e in HISTORY:
+        same = (float(e["tp_pct"]), float(e["sl_pct"]), float(e.get("tp2_pct", TP2_PCT))) == (TP_PCT, SL_PCT, TP2_PCT)
+        if hidden(e) or e.get("cfg") != cfg or offzone(e) != off or same == old:
+            continue
+        for side, res in e["res"].items():
+            bump(e["key"], side, res, e["t"])
+            if e["kind"] == "untested":
+                continue                      # untested setups never feed the totals
+            bump(f"_{side}", side, res, e["t"])                     # every trigger counts, even when two fire on the same candle
+            bump(f"_{side}_{'setup' if e['kind'] == 'setup' else 'align'}", side, res, e["t"])
+    for sides in stats.values():
+        for s in sides.values():
+            s["r"] = round(s["r"] / s["n"], 2) if s["n"] else None
+    return stats
+
+
+def _settings_history():
+    """Distinct TP1/TP2/SL combos other than the current one that logs were made under, with dates and what changed."""
+    g = {}
+    for e in HISTORY:
+        if hidden(e): continue
+        k = (float(e["tp_pct"]), float(e.get("tp2_pct", TP2_PCT)), float(e["sl_pct"]))
+        if k == (TP_PCT, TP2_PCT, SL_PCT): continue
+        a = g.setdefault(k, {"n": 0, "from": e["t"], "to": e["t"]})
+        a["n"] += 1; a["from"] = min(a["from"], e["t"]); a["to"] = max(a["to"], e["t"])
+    out = []
+    for (tp1, tp2, sl), a in sorted(g.items(), key=lambda kv: kv[1]["from"]):
+        diff = [f"{nm} {old:g} → {new:g}" for nm, old, new in (("TP1", tp1, TP_PCT), ("TP2", tp2, TP2_PCT), ("SL", sl, SL_PCT)) if old != new]
+        out.append({"tp1": tp1, "tp2": tp2, "sl": sl, "n": a["n"], "from": a["from"], "to": a["to"], "diff": ", ".join(diff)})
+    return out
+
+
+@app.route("/api/staircase")
+def api():
+    bad = gate()
+    if bad:
+        return bad
+    now = time.time(); cfg = cfg_sig(); week = now - 7 * 86400
+    with LOCK:
+        counts, durs, counts_off = {}, {}, {}
+        for e in HISTORY:
+            if e.get("cfg") != cfg or hidden(e):
+                continue
+            if e["t"] >= week:
+                tgt = counts_off if offzone(e) else counts
+                tgt[e["key"]] = tgt.get(e["key"], 0) + 1
+            if e["kind"] == "align" and e.get("ended"):
+                durs.setdefault(e["key"], []).append(e["ended"] - e["t"])
+        recent = [dict(e, old=(e.get("cfg") != cfg), off=offzone(e)) for e in [x for x in HISTORY[-800:] if not hidden(x)][-300:][::-1]]
+        stats = _stats(cfg)
+        stats_off = _stats(cfg, off=True)
+        stats_old = _stats(cfg, old=True)
+        ema_stats = _ema_stats(cfg)
+    avg_dur = {k: round(sum(v) / len(v) / 60) for k, v in durs.items()}
+    resp = jsonify({"snapshot": STATE["snap"], "why": STATE["why"], "updated": STATE["updated"],
+                    "history": recent, "counts": counts, "counts_off": counts_off, "stats": stats, "stats_off": stats_off, "stats_old": stats_old, "settings_hist": _settings_history(), "zone_filter": [ZONE_FILTER, ZONE_RANGE], "leverage": LEVERAGE, "avg_dur": avg_dur, "ema_stats": ema_stats, "ema_labels": ema_labels(),
+                    "mid_stats": {"30m": _dist_stats(cfg, "mid30_dist", MID_EDGES), "5m": _dist_stats(cfg, "mid5_dist", MID_EDGES)},
+                    "mid_labels": dist_labels(MID_EDGES), "wpr_stats": {"30m": _wpr_stats(cfg, "wpr"), "5m": _wpr_stats(cfg, "wpr5")}, "wpr_labels": [z[0] for z in WPR_ZONES], "blocked_if": [{"side": b[0], "cond": b[1], "why": b[2], "date": b[3]} for b in BLOCKED_IF], "blocked": [{"side": b[0], "h": b[1], "m": b[2], "l": b[3], "why": b[4], "date": b[5]} for b in BLOCKED], "pocket_stats": _pocket_stats(cfg), "pocket": POCKET, "mid_len": MID_LEN, "storage": dict(STORAGE, entries=len(HISTORY)),
+                    "weekly": {"now": build_digest()[1], "reports": list(reversed(WEEKLY[-12:]))},
+                    "tpsl": [TP_PCT, SL_PCT, TP2_PCT], "since": SINCE.get(cfg), "now": now, "tfs": list(LABELS),
+                    "align_colours": ALIGN_COLOURS, "align_dir": ALIGN_DIR,
+                    "untested": [{"direction": d, "letter": L, "h": rh, "m": rm, "p": rp, "l": rl, "note": UNOTES[(d, L)]}
+                                 for (d, L, rh, rm, rp, rl) in UNTESTED],
+                    "rules": [{"direction": d, "letter": L, "h": rh, "m": rm, "p": rp, "l": rl, "note": NOTES[(d, L)]}
+                              for (d, L, rh, rm, rp, rl) in RULES]})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/staircase/digest")
+def api_digest():
+    bad = gate()
+    if bad:
+        return bad
+    _, plain = build_digest()
+    return jsonify({"text": plain})
+
+
+@app.route("/api/staircase/clear", methods=["POST"])
+def clear():
+    bad = gate()
+    if bad:
+        return bad
+    with LOCK:
+        HISTORY.clear()
+        SINCE[cfg_sig()] = time.time()
+        save_history(); save_since()
+    print("[Tracker] history cleared from the page")
+    return jsonify({"ok": True})
+
+
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Staircase">
+<link rel="apple-touch-icon" href="/staircase-icon.png">
+<title>Staircase</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0f1117;color:#d8dbe2;font:15px -apple-system,Segoe UI,Roboto,sans-serif;padding:calc(env(safe-area-inset-top,0px) + 16px) 16px 32px;max-width:520px;margin:0 auto}
+.top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px}
+.top b{font-size:17px}.mut{color:#8b90a0;font-size:12px}
+.card{background:#171a23;border:1px solid #262b38;border-radius:12px;padding:14px;margin-bottom:14px}
+.row{display:grid;grid-template-columns:42px 1fr;gap:8px;align-items:center;margin-bottom:8px}
+.row:last-child{margin-bottom:0}
+.lbl{color:#8b90a0;font-size:12px}
+.chip{display:flex;justify-content:space-between;align-items:center;border-radius:8px;padding:11px 12px;font-weight:600;color:#1a1a19;font-size:15px}
+.chip small{font-weight:500;font-size:11px;opacity:.75}
+.pill{font-weight:600;font-size:12px;border-radius:5px;padding:2px 7px;color:#1a1a19;outline:1px solid rgba(26,26,25,.4)}
+h2{font-size:13px;color:#8b90a0;font-weight:500;margin:0 0 8px}
+.b{display:inline-block;border-radius:5px;padding:2px 8px;font-size:12px;font-weight:600;color:#1a1a19;margin-right:8px}
+.line{display:flex;align-items:center;margin-bottom:7px;font-size:13px}
+.line:last-child{margin-bottom:0}
+.fire{border-color:#3dd68c}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tabs button{flex:1;padding:9px 2px;border-radius:8px;border:1px solid #262b38;background:#171a23;color:#8b90a0;font-size:13px;font-weight:600}
+.tabs{gap:5px}
+pre.rep{white-space:pre-wrap;font:12px/1.5 ui-monospace,Menlo,monospace;color:#d8dbe2;margin:0;overflow-x:auto}
+.tabs button.on{background:#222836;color:#d8dbe2;border-color:#3a4256}
+.g3{display:grid;grid-template-columns:1fr 1fr 2fr;gap:5px}
+.lbl2{color:#8b90a0;font-size:11px;text-align:center}
+.pc{display:block;text-align:center;padding:8px 0;border-radius:6px;color:#1a1a19;font-weight:600;font-size:13px}
+.five{display:grid;grid-template-columns:1fr 14px 1fr;align-items:center;gap:2px}
+.five i{text-align:center;color:#8b90a0;font-style:normal}
+.tg{font-size:11px;padding:2px 6px;border-radius:4px;color:#1a1a19;font-weight:600}
+.empty{color:#8b90a0;font-size:13px}
+input{width:100%;padding:12px;border-radius:8px;border:1px solid #333a4a;background:#0f1117;color:#d8dbe2;font-size:16px;margin-bottom:10px}
+button{width:100%;padding:12px;border-radius:8px;border:0;background:#2a78d6;color:#fff;font-size:15px;font-weight:600}
+a.out{color:#8b90a0;font-size:12px;text-decoration:underline;cursor:pointer}
+</style></head><body>
+<div id="login" class="card" style="display:none">
+ <h2>Password</h2>
+ <input id="pw" type="password" autocomplete="current-password" placeholder="Staircase password">
+ <button id="go">Unlock</button>
+ <div class="mut" id="err" style="margin-top:8px"></div>
+</div>
+<div id="app" style="display:none">
+<div class="top"><b>BTC</b><span class="mut" id="meta">connecting…</span></div>
+<div class="tabs"><button class="on" data-t="live">Live</button><button data-t="setups">Setups</button><button data-t="align">Aligned</button><button data-t="untested">Untested</button><button data-t="mid">Midline</button><button data-t="wpr">WPR</button><button data-t="blocked">Blocked</button><button data-t="weekly">Weekly</button></div>
+<div id="tab_live">
+<div class="card" id="chips"><div class="empty">Loading…</div></div>
+<div class="card" id="state"></div>
+<div class="card"><h2>Right now</h2><div id="ctx" class="mut"></div></div>
+<div class="card"><h2>Last 7 days</h2><div id="counts"></div><div class="mut" id="since"></div></div>
+<div class="card"><h2>Results (all time, current settings)</h2><div id="results"></div></div>
+<div class="card"><h2>Recent</h2><div id="hist"><div class="empty">Nothing yet</div></div></div>
+</div>
+<div id="tab_setups" style="display:none"></div>
+<div id="tab_align" style="display:none"></div>
+<div id="tab_untested" style="display:none"></div>
+<div id="tab_mid" style="display:none"></div>
+<div id="tab_wpr" style="display:none"></div>
+<div id="tab_blocked" style="display:none"></div>
+<div id="tab_weekly" style="display:none"></div>
+<div class="mut" id="params" style="text-align:center;margin-bottom:8px"></div>
+<div class="mut" id="store" style="text-align:center;margin-bottom:8px"></div>
+<div style="text-align:center"><a class="out" id="out">Lock this device</a> &nbsp;·&nbsp; <a class="out" id="clr">Clear history</a></div>
+</div>
+<script>
+const KEY='stair_secret';
+const CH={Red:'#e24b4a',Orange:'#ef9f27',Grey:'#888780',Green:'#3dd68c',Cyan:'#22d3ee'};
+const SC={'short_A++':'#e24b4a',short_B:'#ef9f27',short_C:'#ffeb3b',short_D:'#b794f4',short_E:'#f78fb3','long_A++':'#22d3ee',long_B:'#3dd68c',long_C:'#4c8dff',long_D:'#8e6bff',long_E:'#5eead4','long_A+':'#e2e8f0','short_A+':'#e2e8f0','long_B+':'#cbd5e1','short_B+':'#cbd5e1',long_U1:'#d8b4fe',long_U2:'#f0abfc',long_U3:'#c4b5fd',long_U4:'#e9d5ff',short_U1:'#d8b4fe',short_U2:'#f0abfc'};
+const keyBadge=(e)=>{const k=e.key;if(k.startsWith('align_')){const c=k.slice(6);return `<span class="b" style="background:${CH[c]}">All ${c}</span>`;}const [d,L]=k.split('_');return `<span class="b" style="background:${SC[k]}">${d==='short'?'Short':'Long'} ${L}</span>`;};
+const badge=(d,L)=>`<span class="b" style="background:${SC[d+'_'+L]}">${d==='short'?'Short':'Long'} ${L}</span>`;
+const uk=t=>new Date(t*1000).toLocaleString('en-GB',{timeZone:'Europe/London',weekday:'short',day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+const $=id=>document.getElementById(id);
+const sg=x=>x>0?'+'+x:''+x;
+let timer=null;
+function tick(){const el=document.getElementById('cd');if(!el||!window._nc)return;const left=Math.max(0,Math.round(window._nc-(Date.now()/1000+window._off)));el.textContent=(window._lbl||'5m')+' closes in '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0');}
+setInterval(tick,1000);
+function showLogin(msg){clearInterval(timer);$('app').style.display='none';$('login').style.display='block';$('err').textContent=msg||'';}
+function setTab(t){
+ ['live','setups','align','untested','mid','wpr','blocked','weekly'].forEach(n=>$('tab_'+n).style.display=n===t?'block':'none');
+ document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+}
+const dur=sec=>{sec=Math.max(0,sec);const m=Math.round(sec/60);if(sec<60)return '<1m';if(m<90)return m+'m';return Math.floor(m/60)+'h '+(m%60)+'m';};
+const cnt=x=>`${x.n} done: ${x.w-(x.t2||0)} TP1 only · ${x.t2||0} TP1+TP2 · ${x.l||0} SL`+(x.to?` · ${x.to} timed out`:'')+(x.tn?` · avg ${dur(x.tt/x.tn)} to TP1`:'');
+const resTxt=(x,label)=>{if(!x||(!x.n&&!x.open))return '';return `<div class="mut" style="margin-top:6px">${label?label+': ':''}${x.n?`${cnt(x)} · avg ${sg(x.r)}R`:'none done yet'}${x.open?` · ${x.open} open`:''}</div>`;};
+function renderSetups(d){
+ const rules=d.rules||[],counts=d.counts||{},s=d.snapshot,T=d.tfs||['4H','30m','5m'],st=d.stats||{},so=d.stats_off||{},co=d.counts_off||{};
+ const firing=new Set(s?s.firing.map(f=>f.direction+'_'+f.letter):[]);
+ const near=new Set(s?s.close.map(c=>c.direction+'_'+c.letter):[]);
+ const chip=c=>`<span class="pc" style="background:${CH[c]}">${c}</span>`;
+ const sec=(dir,title)=>`<h2 style="margin:4px 0 8px">${title}</h2>`+rules.filter(r=>r.direction===dir).map(r=>{
+  const k=r.direction+'_'+r.letter,n=counts[k]||0;
+  const tag=firing.has(k)?'<span class="tg" style="background:#3dd68c">firing</span>':near.has(k)?'<span class="tg" style="background:#ef9f27">1 step away</span>':'';
+  return `<div class="card"><div class="line" style="justify-content:space-between;margin-bottom:10px"><span style="display:flex;align-items:center">${badge(r.direction,r.letter)}<span class="mut">${r.letter.endsWith('+')?'⭐ ':''}${r.note}</span></span><span style="display:flex;align-items:center;gap:6px">${tag}<span class="mut">7d: ${n}${co[k]?' · +'+co[k]+' off-zone':''}</span></span></div><div class="g3"><span class="lbl2">${T[0]}</span><span class="lbl2">${T[1]}</span><span class="lbl2">${T[2]} (before → now)</span>${chip(r.h)}${chip(r.m)}<span class="five">${chip(r.p)}<i>→</i>${chip(r.l)}</span></div>${(resTxt((st[k]||{})[r.direction])||'<div class="mut" style="margin-top:6px">No results yet</div>')}${resTxt((so[k]||{})[r.direction],r.direction==='long'?'Off-zone (above midline)':'Off-zone (below midline)')}${resTxt(((d.stats_old||{})[k]||{})[r.direction],'Earlier settings (see Setups tab)')}</div>`;
+ }).join('');
+ $('tab_setups').innerHTML='<div class="card" style="border-color:#ef9f27"><div style="font-size:13px"><b>⭐ Reminder:</b> you think the <b>+ setups (A+, B+)</b> are the real signals, with the best R and the best confirmation. They are still tests, so compare their results with the others before trusting them.</div></div>'+((d.settings_hist||[]).length?`<div class="card"><h2>Settings changes</h2><div class="mut" style="margin-bottom:6px">Now: TP1 ${d.tpsl[0]}% · TP2 ${d.tpsl[2]}% · SL ${d.tpsl[1]}%</div>`+(d.settings_hist||[]).map(h=>`<div style="margin-bottom:6px"><b style="font-size:13px">${h.diff}</b><div class="mut">Was TP1 ${h.tp1}% · TP2 ${h.tp2}% · SL ${h.sl}% · ${h.n} logs, ${new Date(h.from*1000).toLocaleDateString('en-GB',{timeZone:'Europe/London',day:'numeric',month:'short'})} to ${new Date(h.to*1000).toLocaleDateString('en-GB',{timeZone:'Europe/London',day:'numeric',month:'short'})}</div></div>`).join('')+'</div>':'')+sec('short','Shorts')+sec('long','Longs');
+}
+function renderAlign(d){
+ const s=d.snapshot,T=d.tfs||['4H','30m','5m'],st=d.stats||{},so=d.stats_off||{},co=d.counts_off||{},counts=d.counts||{},dur=d.avg_dur||{};
+ const now=s?s.aligned:null;
+ $('tab_align').innerHTML=`<div class="mut" style="margin-bottom:10px">Same colour on ${T.join(' / ')}. Red and Orange count as shorts, Green and Cyan as longs (TP1 ${d.tpsl[0]}% / TP2 ${d.tpsl[2]}% / SL ${d.tpsl[1]}%).</div>`+(d.align_colours||[]).map(c=>{
+  const k='align_'+c,x=st[k]||{};
+  return `<div class="card"><div class="line" style="justify-content:space-between;margin-bottom:6px"><span class="b" style="background:${CH[c]};margin:0">All ${c}</span><span style="display:flex;align-items:center;gap:6px">${now===c?'<span class="tg" style="background:#3dd68c">aligned now</span>':''}<span class="mut">7d: ${counts[k]||0}${co[k]?' · +'+co[k]+' off-zone':''}${dur[k]!==undefined?' · avg stay '+dur[k]+'m':''}</span></span></div>${(()=>{const dr=(d.align_dir||{})[c];return (resTxt(x[dr],dr==='long'?'Long trade':'Short trade'))||`<div class="mut">${dr==='long'?'Long':'Short'} trade: no results yet</div>`;})()}${(()=>{const dr=(d.align_dir||{})[c];return resTxt((so[k]||{})[dr],dr==='long'?'Off-zone (above midline)':'Off-zone (below midline)');})()}${(()=>{const dr=(d.align_dir||{})[c];return resTxt(((d.stats_old||{})[k]||{})[dr],'Earlier settings (see Setups tab)');})()}</div>`;
+ }).join('');
+}
+function renderUntested(d){
+ const rules=d.untested||[],counts=d.counts||{},s=d.snapshot,T=d.tfs||['4H','30m','5m'],st=d.stats||{},so=d.stats_off||{},co=d.counts_off||{};
+ const firing=new Set(s&&s.ufiring?s.ufiring.map(f=>f.direction+'_'+f.letter):[]);
+ const near=new Set(s&&s.uclose?s.uclose.map(c=>c.direction+'_'+c.letter):[]);
+ const chip=c=>`<span class="pc" style="background:${CH[c]}">${c}</span>`;
+ $('tab_untested').innerHTML='<div class="card" style="border-color:#d8b4fe"><div style="font-size:13px"><b>Untested setups.</b> The ones you think are the best. They are logged and scored like the others (same TP / SL), but kept out of the main Results and totals until the numbers prove it.</div></div>'+(rules.length?rules.map(r=>{
+  const k=r.direction+'_'+r.letter,n=counts[k]||0;
+  const tag=firing.has(k)?'<span class="tg" style="background:#3dd68c">firing</span>':near.has(k)?'<span class="tg" style="background:#ef9f27">1 step away</span>':'';
+  return `<div class="card"><div class="line" style="justify-content:space-between;margin-bottom:10px"><span style="display:flex;align-items:center">${badge(r.direction,r.letter)}<span class="mut">${r.note}</span></span><span style="display:flex;align-items:center;gap:6px">${tag}<span class="mut">7d: ${n}${co[k]?' · +'+co[k]+' off-zone':''}</span></span></div><div class="g3"><span class="lbl2">${T[0]}</span><span class="lbl2">${T[1]}</span><span class="lbl2">${T[2]} (before → now)</span>${chip(r.h)}${chip(r.m)}<span class="five">${chip(r.p)}<i>→</i>${chip(r.l)}</span></div>${(resTxt((st[k]||{})[r.direction])||'<div class="mut" style="margin-top:6px">No results yet</div>')}${resTxt((so[k]||{})[r.direction],r.direction==='long'?'Off-zone (above midline)':'Off-zone (below midline)')}${resTxt(((d.stats_old||{})[k]||{})[r.direction],'Earlier settings (see Setups tab)')}</div>`;
+ }).join(''):'<div class="empty">No untested setups yet</div>');
+}
+function renderMid(d){
+ window._d=d;const tf=window._midTf||'30m',L=d.mid_labels||[],ms=(d.mid_stats||{})[tf]||{};
+ const row=(t,x)=>`<div style="margin-bottom:9px"><div class="line" style="margin-bottom:2px"><b style="font-size:13px">${t}</b></div><div class="mut">${x&&x.n?cnt(x)+' · avg '+sg(x.r)+'R':'none done yet'}${x&&x.open?' · '+x.open+' open':''}</div></div>`;
+ const sec=(side,title)=>{
+  const top=row('Price above the midline',(ms[side]||{}).__above)+row('Price below the midline',(ms[side]||{}).__below);
+  const rows=L.filter(b=>ms[side]&&ms[side][b]).map(b=>row(b,ms[side][b])).join('');
+  return `<div class="card"><h2>${title}</h2>${top}${rows?'<div class="mut" style="margin:10px 0 6px">By distance from the line (negative = below)</div>'+rows:''}</div>`;};
+ const btn=t=>`<button onclick="window._midTf='${t}';renderMid(window._d)" style="margin-right:6px;padding:5px 12px;border-radius:8px;border:1px solid #2a2e3d;background:${t===tf?'#2a2e3d':'transparent'};color:#e6e8ef;font-size:13px">${t} range</button>`;
+ $('tab_mid').innerHTML=`<div class="mut" style="margin-bottom:8px">Results of logged trades by where price was against the midline (halfway between the highest high and lowest low of the last ${d.mid_len||100} bars) when they fired. 30m range = ${d.mid_len||100} thirty-minute bars. 5m range = what a 5m chart draws. Needs a few weeks of data before it means much.</div><div style="margin-bottom:10px">${btn('30m')}${btn('5m')}</div>`+sec('long','Long trades')+sec('short','Short trades');
+}
+function renderWpr(d){
+ window._d=d;const tf=window._wprTf||'30m',L=d.wpr_labels||[],ws=(d.wpr_stats||{})[tf]||{};
+ const row=(t,x)=>`<div style="margin-bottom:9px"><div class="line" style="margin-bottom:2px"><b style="font-size:13px">${t}</b></div><div class="mut">${cnt(x)+' · avg '+sg(x.r)+'R'}${x.open?' · '+x.open+' open':''}</div></div>`;
+ const sec=(side,title)=>{const rows=L.filter(b=>ws[side]&&ws[side][b]&&(ws[side][b].n||ws[side][b].open)).map(b=>row(b,ws[side][b])).join('');return `<div class="card"><h2>${title}</h2>${rows||'<div class="empty">No logged trades yet</div>'}</div>`;};
+ const pk=d.pocket_stats||{},pr=d.pocket||{};
+ const pc=['long','short'].map(sd=>{const x=pk[sd]||{};if(!(x.in||x.out))return '';const ln=(t,y)=>y?`<div class="mut" style="margin-bottom:4px">${t}: ${y.n?cnt(y)+' · avg '+sg(y.r)+'R':'none done yet'}${y.open?' · '+y.open+' open':''}</div>`:`<div class="mut" style="margin-bottom:4px">${t}: none yet</div>`;return `<div class="card"><h2>${sd==='long'?'Long':'Short'} A++ · 30m WPR pocket ${pr[sd]?pr[sd][0]+' to '+pr[sd][1]:''}</h2>${ln('Inside the pocket',x.in)}${ln('Outside the pocket',x.out)}</div>`}).join('');
+ const btn=t=>`<button onclick="window._wprTf='${t}';renderWpr(window._d)" style="margin-right:6px;padding:5px 12px;border-radius:8px;border:1px solid #2a2e3d;background:${t===tf?'#2a2e3d':'transparent'};color:#e6e8ef;font-size:13px">${t} WPR</button>`;
+ $('tab_wpr').innerHTML=`<div class="mut" style="margin-bottom:8px">Results of logged trades by the Williams %R reading when they fired (length 200). -100 is oversold, 0 is overbought. 5m WPR is only recorded on new logs, so it starts empty.</div>${pc}<div style="margin-bottom:10px">${btn('30m')}${btn('5m')}</div>`+sec('long','Long trades')+sec('short','Short trades');
+}
+function renderBlocked(d){
+ const L=d.blocked||[];
+ const BI=d.blocked_if||[];
+ const rows=['short','long'].map(sd=>{const r=L.filter(b=>b.side===sd),ri=BI.filter(b=>b.side===sd);return `<div class="card"><h2>${sd==='short'?'Shorts':'Longs'} blocked (${r.length+ri.length})</h2>`+ri.map(b=>`<div style="margin-bottom:9px"><div class="line" style="margin-bottom:2px"><b style="font-size:13px">If ${b.cond}</b><span class="mut" style="margin-left:8px">${b.date}</span></div><div class="mut">${b.why}</div></div>`).join('')+(r.map(b=>`<div style="margin-bottom:9px"><div class="line" style="margin-bottom:2px"><b style="font-size:13px">${[b.h,b.m,b.l].map(x=>x==='*'?'any':x).join(' / ')}</b><span class="mut" style="margin-left:8px">${b.date}</span></div><div class="mut">${b.why}</div></div>`).join('')||'<div class="empty">None</div>')+'</div>';}).join('');
+ $('tab_blocked').innerHTML=`<div class="mut" style="margin-bottom:8px">Every state where one side is blocked. Format: ${(d.tfs||['4H','30m','5m']).join(' / ')} (5m = colour now). Nothing in these states is traded, alerted or counted.</div>`+rows;
+}
+function renderEma(d){
+ const L=d.ema_labels||[],es=d.ema_stats||{};
+ const sec=(side,title)=>{
+  const rows=L.filter(b=>es[side]&&es[side][b]).map(b=>{const x=es[side][b];return `<div style="margin-bottom:9px"><div class="line" style="margin-bottom:2px"><b style="font-size:13px">${b}</b></div><div class="mut">${x.n?cnt(x)+' · avg '+sg(x.r)+'R':'none done yet'}${x.open?' · '+x.open+' open':''}</div></div>`;}).join('');
+  return `<div class="card"><h2>${title}</h2>${rows||'<div class="empty">No logged trades yet</div>'}</div>`;};
+ $('tab_ema').innerHTML=`<div class="mut" style="margin-bottom:10px">Results of logged ${'trades'} by how far price was from the 200 EMA (${(d.snapshot&&d.snapshot.ctx&&d.snapshot.ctx.ctx_tf)||'30m'}) when they fired. Negative = price below the EMA. Needs a few weeks of data before the buckets mean much.</div>`+sec('long','Long trades')+sec('short','Short trades');
+}
+function renderWeekly(d){
+ const w=d.weekly||{},esc=t=>String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\b(Longs?)\b/g,'<b style="color:#3dd68c">$1</b>').replace(/\b(Shorts?)\b/g,'<b style="color:#e24b4a">$1</b>').replace(/(\+\d+(?:\.\d+)?R)/g,'<span style="color:#3dd68c;font-weight:600">$1</span>').replace(/(-\d+(?:\.\d+)?R)/g,'<span style="color:#e24b4a;font-weight:600">$1</span>').replace(/^(By trigger|By price|Best|Worst|Off-zone|Staircase weekly)/gm,'<b>$1</b>');
+ const past=(w.reports||[]).map(r=>`<div class="card"><h2>Report · ${uk(r.t)}</h2><pre class="rep">${esc(r.text)}</pre></div>`).join('');
+ $('tab_weekly').innerHTML=`<div class="card"><h2>Last 7 days (live)</h2><pre class="rep">${esc(w.now||'')}</pre></div>`+(past?`<h2 style="margin:4px 0 8px">Past weekly reports</h2>`+past:'<div class="mut" style="margin-bottom:10px">A report is saved here every Sunday at 8pm UK time.</div>');
+}
+function renderStore(d){
+ const st=d.storage||{},el=$('store');let msg,col='#8b90a0';
+ if(st.mode==='file'){msg='⚠ Saving to a file, not a database. History is lost on every redeploy unless DATABASE_URL is set on Railway.';col='#e24b4a';}
+ else if(!st.loaded){msg='⚠ Saved history not loaded yet, saving is paused. '+(st.error||'');col='#e24b4a';}
+ else if(!st.ok){msg='⚠ Last save failed: '+(st.error||'unknown error');col='#e24b4a';}
+ else msg='History saved to the database · '+st.entries+' entries';
+ el.textContent=msg;el.style.color=col;
+}
+function setHf(k){window._hf=(window._hf===k)?null:k;if(window._d)render(window._d);}
+function render(d){
+ window._d=d;
+ renderStore(d);
+ const s=d.snapshot;const T=d.tfs||['4H','30m','5m'];
+ if(!s){$('chips').innerHTML='<div class="empty">Waiting for the data feed…'+(d.why?'<br><small>'+d.why+'</small>':'')+'</div>';$('state').innerHTML='';$('ctx').textContent='';}
+ else{
+  $('params').textContent='Timeframes '+T.join(' / ')+' · lookback '+s.params[0]+' · z-score '+s.params[1]+' · extremes '+s.params[2]+'/'+s.params[3]+' · '+T[0]+' '+(s.live[0]?'live':'closed')+', '+T[1]+' '+(s.live[1]?'live':'closed');
+  $('meta').textContent=s.price.toLocaleString('en-GB',{maximumFractionDigits:1})+' · '+uk(d.now)+(s.skip?' · not logging today':'');
+  const r=(l,v,c,extra,pill)=>`<div class="row"><span class="lbl">${l}</span><span class="chip" style="background:${CH[c]}"><span>${c}${extra||''}</span><span style="display:flex;align-items:center;gap:8px">${pill||''}${v.toFixed(1)}</span></span></div>`;
+  const live=(s.live5!==null&&s.live5!==undefined)?`<span class="pill" style="background:${CH[s.live5_col]}">live ${s.live5.toFixed(1)}</span>`:'';
+  $('chips').innerHTML=r(T[0],s.h,s.cols[0])+r(T[1],s.m,s.cols[1])+r(T[2],s.l,s.cols[3],s.cols[2]!==s.cols[3]?` <small>from ${s.cols[2]}</small>`:'',live)+'<div class="mut" style="display:flex;justify-content:space-between;margin-top:10px"><span>Logs use the closed value</span><span id="cd"></span></div>';
+  window._lbl=T[2];window._nc=s.next_close;window._off=d.now-Date.now()/1000;tick();
+  const c=s.ctx||{};
+  const sgn=v=>(v>0?'+':'')+v;
+  $('ctx').innerHTML=(c.wpr!==undefined?`WPR ${c.wpr} · price ${c.ema_side} EMA200 (${c.ctx_tf}, ${sgn(c.ema_dist)}%)`:'')+(c.mid30!==undefined?`<br>Price ${c.mid30_side} the 30m midline (${sgn(c.mid30_dist)}%)`:'')||'No context yet';
+  const st=$('state');
+  const al=s.aligned?`<div class="line"><span class="b" style="background:${CH[s.aligned]}">All ${s.aligned}</span><span>aligned on every timeframe</span></div>`:'';
+  if(s.firing.length){
+   st.className='card fire';
+   st.innerHTML='<h2>Firing on the last '+T[2]+' close</h2>'+s.firing.map(f=>`<div class="line">${badge(f.direction,f.letter)}<span>all conditions met</span></div>`).join('')+al;
+  }else{
+   st.className='card'+(s.aligned?' fire':'');
+   st.innerHTML='<h2>Setups close to firing</h2>'+al+(s.close.length?s.close.map(c=>`<div class="line">${badge(c.direction,c.letter)}<span>${c.missing}</span></div>`).join(''):'<div class="empty">None close right now. Nothing is one step away.</div>');
+  }
+ }
+ const letters=dir=>(d.rules||[]).filter(r=>r.direction===dir).map(r=>r.letter);
+ $('counts').innerHTML=['short','long'].map(dir=>`<div style="display:grid;grid-template-columns:repeat(${letters(dir).length||5},1fr);gap:6px;margin-bottom:8px">${letters(dir).map(x=>{const n=(d.counts||{})[dir+'_'+x]||0;const kk=dir+'_'+x;return `<div onclick="setHf('${kk}')" style="text-align:center;cursor:pointer;opacity:${n?1:.4};border-radius:8px;${window._hf===kk?'outline:2px solid #e6e8ef;outline-offset:2px;':''}"><span class="b" style="background:${SC[dir+'_'+x]};margin:0">${dir==='short'?'S':'L'} ${x}</span><div style="font-size:20px;font-weight:600;margin-top:4px">${n}</div></div>`}).join('')}</div>`).join('')
+  +`<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:4px">${(d.align_colours||[]).map(c=>{const n=(d.counts||{})['align_'+c]||0;const kk='align_'+c;return `<div onclick="setHf('${kk}')" style="text-align:center;cursor:pointer;opacity:${n?1:.4};border-radius:8px;${window._hf===kk?'outline:2px solid #e6e8ef;outline-offset:2px;':''}"><span class="b" style="background:${CH[c]};margin:0">${c}</span><div style="font-size:20px;font-weight:600;margin-top:4px">${n}</div></div>`}).join('')}</div><div class="mut" style="margin-top:4px">Bottom row: all three timeframes the same colour</div>`;
+ const tp=d.tpsl||[0.45,0.33],stt=d.stats||{};
+ const ov=['short','long'].map(dir=>{const g=k=>(stt[k]||{})[dir],x=g('_'+dir),a=g('_'+dir+'_setup'),b=g('_'+dir+'_align'),nm=dir==='short'?'Shorts':'Longs';const xo=(d.stats_off||{})['_'+dir];const xoo=xo&&xo[dir];const offLine=xoo&&(xoo.n||xoo.open)?`<div class="mut" style="margin-top:8px">${dir==='short'?'Shorts below the midline (off-zone, kept separate)':'Longs above the midline (off-zone, kept separate)'}: ${xoo.n?cnt(xoo)+' · avg '+sg(xoo.r)+'R':'none done yet'}${xoo.open?' · '+xoo.open+' open':''}</div>`:'';if(!(x&&x.n))return offLine||null;const sub=(t,y)=>y&&y.n?`<div class="mut" style="margin-top:2px;padding-left:10px">${t}: ${cnt(y)} · avg ${sg(y.r)}R</div>`:'';return `<b>${nm}, every trigger (setups + alignments): ${cnt(x)} · avg ${sg(x.r)}R</b>`+sub('Setups only',a)+sub(dir==='short'?'All Red / All Orange':'All Green / All Cyan',b)+offLine}).filter(Boolean);
+ $('results').innerHTML=`<div class="mut">TP1 ${tp[0]}% / TP2 ${tp[2]}% / SL ${tp[1]}% (TP1 ${(tp[0]/tp[1]).toFixed(1)}R, TP2 ${(tp[2]/tp[1]).toFixed(1)}R)</div>`+(ov.length?ov.map(t=>`<div class="line" style="margin-top:6px">${t}</div>`).join(''):'<div class="empty" style="margin-top:6px">No finished trades yet</div>');
+ $('since').textContent=d.since?'Tracking since '+uk(d.since)+' on these settings':'';
+ const LV=d.leverage||50;
+ const f1=v=>v.toLocaleString('en-GB',{minimumFractionDigits:1,maximumFractionDigits:1});
+ const lvls=e=>Object.keys(e.res||{}).map(sd=>{const p=Number(e.price),sh=sd==='short',m=(x)=>sh?p*(1-x/100):p*(1+x/100),sl=sh?p*(1+e.sl_pct/100):p*(1-e.sl_pct/100);return `${Object.keys(e.res).length>1?(sh?'Short ':'Long ')+': ':''}entry ${f1(p)} · TP1 ${f1(m(e.tp_pct))} · TP2 ${f1(m(e.tp2_pct||e.tp_pct))} · SL ${f1(sl)}<br>at ${LV}x: TP1 +${(e.tp_pct*LV).toFixed(1)}% · TP2 +${((e.tp2_pct||e.tp_pct)*LV).toFixed(1)}% · SL −${(e.sl_pct*LV).toFixed(1)}% of margin`;}).join('<br>');
+ const sides=e=>e.obs?'<span class="mut">Logged only · blocked, not a trade</span>':Object.entries(e.res||{}).map(([sd,r])=>{const lab=e.kind==='align'?(sd==='long'?'Long':'Short')+': ':'';if(!r)return (e.tp1&&e.tp1[sd])?`<span style="font-size:12px;font-weight:600;color:#3dd68c">${lab}TP1 hit · TP2 pending</span>`:`<span class="mut">${lab}open…</span>`;const ok=['win','tp1','tp2'].includes(r.outcome);const col=ok?'#3dd68c':r.outcome==='loss'?'#e24b4a':'#8b90a0';const nm=r.outcome==='tp2'?'TP1 + TP2':ok?'TP1 only':r.outcome==='loss'?'SL hit':'timed out';const t1x=r.t1||(['tp1','tp2'].includes(r.outcome)&&e.tp1&&e.tp1[sd]);const tm=r.outcome==='loss'?` · SL after ${dur(r.at-e.t)}`:(t1x?` · TP1 after ${dur(t1x-e.t)}`+(r.outcome==='tp2'?`, TP2 after ${dur(r.at-e.t)}`:''):'');return `<span style="font-size:12px;font-weight:600;color:${col}">${lab}${nm} ${sg(r.r)}R${tm}</span>`;}).join(' &nbsp; ');
+ const hf=window._hf||null,HL=(hf?d.history.filter(e=>e.key===hf):d.history).slice(0,hf?100:25);
+ $('hist').innerHTML=(hf?`<div class="mut" style="margin-bottom:10px">Showing ${keyBadge({key:hf})} only (${HL.length}) · <a class="out" onclick="setHf('${hf}')" style="cursor:pointer">show all</a></div>`:'')+(HL.length?HL.map(e=>`<div style="opacity:${e.old?.45:1};margin-bottom:10px"><div class="line" style="margin-bottom:3px">${keyBadge(e)}<span>${uk(e.t)} · ${Number(e.price).toLocaleString('en-GB',{maximumFractionDigits:1})}</span></div>${e.vals&&e.vals.length?`<div class="mut">${T[0]} ${e.vals[0]} · ${T[1]} ${e.vals[1]} · ${T[2]} ${e.vals[2]}</div>`:''}${e.mid30!==undefined?`<div class="mut">${e.mid30_side} 30m midline (${e.mid30_dist>0?'+':''}${e.mid30_dist}%)${e.wpr===undefined&&e.kind==='align'?(e.ended?` · stayed aligned ${Math.round((e.ended-e.t)/60)}m`:' · still aligned'):''}</div>`:''}${e.wpr!==undefined?`<div class="mut">WPR ${e.wpr}${e.wpr5!==undefined?' (5m '+e.wpr5+')':''}${e.pocket===true?' · ⭐ in A++ pocket':e.pocket===false?' · outside A++ pocket':''} · ${e.ema_side} EMA200 (${e.ema_dist>0?'+':''}${e.ema_dist}%)${e.kind==='align'?(e.ended?` · stayed aligned ${Math.round((e.ended-e.t)/60)}m`:' · still aligned'):''}</div>`:''}<div class="mut">${lvls(e)}</div><div>${sides(e)}</div>${e.old?'<div class="mut">old settings, not counted</div>':''}${(Number(e.tp_pct)!==d.tpsl[0]||Number(e.sl_pct)!==d.tpsl[1]||Number(e.tp2_pct||e.tp_pct)!==d.tpsl[2])?`<div class="mut">logged at TP1 ${e.tp_pct}% · TP2 ${e.tp2_pct||e.tp_pct}% · SL ${e.sl_pct}% (not the current settings)</div>`:''}${e.off&&!e.old?'<div class="mut" style="color:#ef9f27">off-zone: counted separately, not in the main results</div>':''}</div>`).join(''):'<div class="empty">Nothing yet</div>');
+ renderSetups(d);renderAlign(d);renderUntested(d);renderMid(d);renderWpr(d);renderBlocked(d);renderWeekly(d);
+}
+async function load(){
+ const s=localStorage.getItem(KEY);
+ if(!s){showLogin();return;}
+ try{
+  const r=await fetch('/api/staircase',{headers:{'X-Secret':s},cache:'no-store'});
+  if(r.status===401){localStorage.removeItem(KEY);showLogin('Wrong password');return;}
+  if(r.status===429){showLogin('Too many attempts, wait a few minutes');return;}
+  if(r.status===503){showLogin('Not set up yet: add STAIRCASE_TOKEN on Railway');return;}
+  if(!r.ok)throw new Error(r.status);
+  $('login').style.display='none';$('app').style.display='block';
+  render(await r.json());
+  if(!timer)timer=setInterval(load,10000);
+ }catch(e){$('meta').textContent='connection lost';}
+}
+$('go').onclick=()=>{const v=$('pw').value.trim();if(!v)return;localStorage.setItem(KEY,v);$('pw').value='';timer=null;load();};
+$('pw').addEventListener('keydown',e=>{if(e.key==='Enter')$('go').click();});
+$('clr').onclick=async()=>{if(!confirm('Clear the recorded history and restart the count?'))return;try{await fetch('/api/staircase/clear',{method:'POST',headers:{'X-Secret':localStorage.getItem(KEY)||''}});}catch(e){}load();};
+$('out').onclick=()=>{localStorage.removeItem(KEY);timer=null;showLogin();};
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>setTab(b.dataset.t));
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&localStorage.getItem(KEY))load();});
+load();
+</script></body></html>"""
+
+# Start the background loop when the module loads (gunicorn imports it once with one worker)
+if os.environ.get("TRACKER_NO_AUTOSTART") != "1":
+    start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
